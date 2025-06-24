@@ -9,7 +9,7 @@ on:
   schedule:
     - cron: '40 14 * * *'
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]  # Build for all branches
     # Publish semver tags as releases.
     tags: [ 'v*.*.*' ]
   pull_request:
@@ -66,6 +66,26 @@ jobs:
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with semver if it's a version tag
+            type=semver,pattern={{version}}
+            # Tag with raw branch name for branch builds
+            type=raw,value=branch-{{branch}}
+
+      # Set branch-specific tags
+      - name: Set Docker tags
+        id: docker-tags
+        run: |
+          TAGS="${{ steps.meta.outputs.tags }}"
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # For main branch, add latest tag
+            echo "DOCKER_TAGS=${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_ENV
+            echo "Tagged main branch with :latest"
+          else
+            # For other branches, add dev tag
+            echo "DOCKER_TAGS=${TAGS},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev" >> $GITHUB_ENV
+            echo "Tagged non-main branch with :dev"
+          fi
 
       # Build and push Docker image with Buildx (don't push on PR)
       - name: Build and push Docker image
@@ -75,9 +95,7 @@ jobs:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ steps.meta.outputs.tags }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.DOCKER_TAGS }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

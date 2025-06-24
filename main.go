@@ -92,7 +92,7 @@ type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
 		ID        string `json:"id"`
-		Size      int64  `json:"size"`      // Size in bytes
+		Size      int64  `json:"size"` // Size in bytes
 		Processor string `json:"processor"`
 		Until     string `json:"until"`
 	} `json:"models"`
@@ -168,7 +168,7 @@ func main() {
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
-	
+
 	// Custom metrics handler that refreshes model data before serving metrics
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Refresh model information from /api/ps before serving metrics
@@ -180,12 +180,12 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
+
 					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
@@ -197,11 +197,11 @@ func main() {
 		} else {
 			log.Printf("ERROR refreshing model metrics: %v", err)
 		}
-		
+
 		// Serve metrics using the standard Prometheus handler
 		promhttp.Handler().ServeHTTP(w, r)
 	})
-	
+
 	// All other paths -> proxy handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -216,6 +216,33 @@ func main() {
 		if r.Body != nil {
 			bodyBytes, _ = io.ReadAll(r.Body)
 			r.Body.Close()
+		}
+
+		// Process the request body for generate and chat endpoints to remove num_ctx option
+		if len(bodyBytes) > 0 && (r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat") {
+			var requestData map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &requestData); err == nil {
+				// Check if the request has options with num_ctx
+				if options, ok := requestData["options"].(map[string]interface{}); ok {
+					if _, exists := options["num_ctx"]; exists {
+						// Remove num_ctx so default will be used
+						delete(options, "num_ctx")
+						log.Printf("Removed num_ctx parameter from request to use model default")
+
+						// If options is now empty, remove it entirely
+						if len(options) == 0 {
+							delete(requestData, "options")
+						}
+
+						// Reserialize the modified request
+						if modifiedBody, err := json.Marshal(requestData); err == nil {
+							bodyBytes = modifiedBody
+						} else {
+							log.Printf("ERROR reserializing modified request: %v", err)
+						}
+					}
+				}
+			}
 		}
 
 		// Build upstream request
@@ -349,13 +376,13 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-						// Convert size from bytes to megabytes
+
+					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
 					log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)
