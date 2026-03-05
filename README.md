@@ -78,7 +78,7 @@ This will start:
 - Prometheus for metrics collection
 - Grafana with pre-configured dashboard
 
-Access Grafana at http://localhost:3000 (default credentials: admin/admin)
+Access Grafana at http://localhost:3000 (default credentials: admin/password)
 
 ## Building from Source
 
