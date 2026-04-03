@@ -88,6 +88,18 @@ type generateResponse struct {
 	DoneReason         interface{} `json:"done_reason,omitempty"`
 }
 
+// OpenAI-compatible API response structs (/v1/chat/completions, /v1/completions)
+type openAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type openAIResponse struct {
+	Model string       `json:"model"`
+	Usage *openAIUsage `json:"usage,omitempty"`
+}
+
 type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
@@ -218,6 +230,21 @@ func main() {
 			r.Body.Close()
 		}
 
+		// For OpenAI-compatible streaming requests, inject stream_options
+		// to ensure the final SSE chunk includes token usage statistics.
+		// Without this, Ollama's streaming responses omit the usage field.
+		if strings.HasPrefix(r.URL.Path, "/v1/") && len(bodyBytes) > 0 {
+			var reqJson map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &reqJson); err == nil {
+				if stream, ok := reqJson["stream"].(bool); ok && stream {
+					if reqJson["stream_options"] == nil {
+						reqJson["stream_options"] = map[string]interface{}{"include_usage": true}
+						bodyBytes, _ = json.Marshal(reqJson)
+					}
+				}
+			}
+		}
+
 		// Build upstream request
 		targetURL := upstreamAddr + r.URL.Path
 		if r.URL.RawQuery != "" {
@@ -267,7 +294,72 @@ func main() {
 		var promptCount, generatedCount int
 		var evalDurationNs int64
 
-		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			// OpenAI-compatible endpoints (/v1/chat/completions, /v1/completions, /v1/embeddings)
+			contentType := respUp.Header.Get("Content-Type")
+			isStreaming := strings.Contains(contentType, "text/event-stream")
+
+			if isStreaming {
+				// Streaming SSE: forward chunks to client, parse usage from final chunk
+				var buf bytes.Buffer
+				streamWriter := io.MultiWriter(w, &buf)
+				flusher, _ := w.(http.Flusher)
+				chunk := make([]byte, 4096)
+				for {
+					n, readErr := respUp.Body.Read(chunk)
+					if n > 0 {
+						if _, writeErr := streamWriter.Write(chunk[:n]); writeErr != nil {
+							log.Printf("WARNING: client write error: %v", writeErr)
+							break
+						}
+						if flusher != nil {
+							flusher.Flush()
+						}
+					}
+					if readErr != nil {
+						if readErr != io.EOF {
+							log.Printf("ERROR reading upstream: %v", readErr)
+						}
+						break
+					}
+				}
+				// Parse SSE data lines for model and usage
+				for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+					line = bytes.TrimSpace(line)
+					if !bytes.HasPrefix(line, []byte("data: ")) {
+						continue
+					}
+					data := bytes.TrimPrefix(line, []byte("data: "))
+					if bytes.Equal(data, []byte("[DONE]")) {
+						continue
+					}
+					var oaiResp openAIResponse
+					if err := json.Unmarshal(data, &oaiResp); err == nil {
+						if oaiResp.Model != "" {
+							modelName = ensureModelTag(oaiResp.Model)
+						}
+						if oaiResp.Usage != nil {
+							promptCount = oaiResp.Usage.PromptTokens
+							generatedCount = oaiResp.Usage.CompletionTokens
+						}
+					}
+				}
+			} else {
+				// Non-streaming: read full response body
+				bodyData, _ := io.ReadAll(respUp.Body)
+				w.Write(bodyData)
+				var oaiResp openAIResponse
+				if err := json.Unmarshal(bodyData, &oaiResp); err == nil {
+					if oaiResp.Model != "" {
+						modelName = ensureModelTag(oaiResp.Model)
+					}
+					if oaiResp.Usage != nil {
+						promptCount = oaiResp.Usage.PromptTokens
+						generatedCount = oaiResp.Usage.CompletionTokens
+					}
+				}
+			}
+		} else if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
 			// Handle streaming JSON response for generate/chat
 			var buf bytes.Buffer
 			// MultiWriter to write to client output and buffer simultaneously
