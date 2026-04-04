@@ -1,0 +1,19 @@
+extends: default
+
+rules:
+  document-start: disable
+  line-length:
+    max: 200
+    allow-non-breakable-words: true
+  truthy:
+    allowed-values:
+      - "true"
+      - "false"
+      - "yes"
+      - "no"
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    spaces: 2
+    indent-sequences: consistent

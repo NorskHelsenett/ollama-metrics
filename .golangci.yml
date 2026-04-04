@@ -1,0 +1,43 @@
+version: "2"
+timeout: 5m
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gocritic
+    - misspell
+    - gosec
+  settings:
+    errcheck:
+      exclude-functions:
+        - io.Copy
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+    gosec:
+      excludes:
+        # Unhandled errors on Close: already excluded via errcheck settings
+        - G104
+        # SSRF: upstream URL comes from env var, not user input
+        - G704
+        # Log injection: log values come from env vars and internal state
+        - G706
+        # HTTP server timeouts: acceptable for a proxy with long-running inference
+        - G114
+  exclusions:
+    rules:
+      # Upstream code: if-else chain is clearer than switch for URL path matching
+      - linters:
+          - gocritic
+        text: "ifElseChain"
+      # Upstream code: range copy is acceptable for small structs in non-hot paths
+      - linters:
+          - gocritic
+        text: "rangeValCopy"

@@ -1,5 +1,9 @@
 # Ollama Metrics Sidecar
 
+> **Note:** This is a fork of [NorskHelsenett/ollama-metrics](https://github.com/NorskHelsenett/ollama-metrics),
+> originally created by [NorskHelsenett](https://github.com/NorskHelsenett).
+> This fork adds CI/CD, container build standardization, and ongoing maintenance.
+
 A lightweight metrics collector and proxy for [Ollama](https://ollama.com/) that exposes Prometheus metrics for monitoring your LLM deployments.
 
 ![cover image](.docs/cover.png)
@@ -31,13 +35,13 @@ It acts as a transparent proxy, forwarding all requests to Ollama while collecti
 - `OLLAMA_HOST` - Ollama host address (default: `http://localhost:11434`)
 - `PORT` - Port to run the metrics server on (default: `8080`)
 
-### Docker
+### Container
 
 ```bash
-docker run -d --name ollama-metrics \
+podman run -d --name ollama-metrics \
   -e OLLAMA_HOST=http://ollama:11434 \
   -p 8080:8080 \
-  ghcr.io/norskhelsenett/ollama-metrics:latest
+  quay.io/clcollins/ollama-metrics:latest
 ```
 
 ### Local Development
@@ -67,31 +71,39 @@ Access Prometheus metrics at http://localhost:8080/metrics
 
 ## Prometheus & Grafana Setup
 
-A pre-configured Prometheus and Grafana setup is available in the `prometheus/` directory:
+A pre-configured Prometheus and Grafana monitoring stack is available in the `prometheus/` directory
+using `podman kube play`:
 
 ```bash
-cd prometheus
-docker-compose up -d
+podman kube play prometheus/monitoring.yaml
 ```
 
-This will start:
-- Prometheus for metrics collection
-- Grafana with pre-configured dashboard
+This will start a pod with:
 
-Access Grafana at http://localhost:3000 (default credentials: admin/admin)
+- Node Exporter for system metrics
+- Prometheus for metrics collection
+- Grafana for visualization
+
+Access Grafana at `http://localhost:3000` (default credentials: admin/admin)
+
+To stop the monitoring stack:
+
+```bash
+podman kube down prometheus/monitoring.yaml
+```
 
 ## Building from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/NorskHelsenett/ollama-metrics.git
+git clone https://github.com/clcollins/ollama-metrics.git
 cd ollama-metrics
 
-# Build
-docker build -t ollama-metrics .
+# Build with make
+make build
 
-# Or build locally
-go build -o ollama-metrics
+# Or build the container image
+make image-build
 ```
 
 ## Screenshots
@@ -101,6 +113,12 @@ go build -o ollama-metrics
 ## License
 
 [MIT License](LICENSE)
+
+The upstream repository ([NorskHelsenett/ollama-metrics](https://github.com/NorskHelsenett/ollama-metrics))
+does not include a LICENSE file, but its README references an MIT License.
+This fork assumes MIT based on that stated intent and includes a LICENSE file
+accordingly. If the upstream authors clarify a different license, this fork
+will be updated to comply.
 
 ## Contributing
 

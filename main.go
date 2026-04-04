@@ -92,7 +92,7 @@ type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
 		ID        string `json:"id"`
-		Size      int64  `json:"size"`      // Size in bytes
+		Size      int64  `json:"size"` // Size in bytes
 		Processor string `json:"processor"`
 		Until     string `json:"until"`
 	} `json:"models"`
@@ -168,7 +168,7 @@ func main() {
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
-	
+
 	// Custom metrics handler that refreshes model data before serving metrics
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Refresh model information from /api/ps before serving metrics
@@ -180,12 +180,12 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
+
 					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
@@ -197,11 +197,11 @@ func main() {
 		} else {
 			log.Printf("ERROR refreshing model metrics: %v", err)
 		}
-		
+
 		// Serve metrics using the standard Prometheus handler
 		promhttp.Handler().ServeHTTP(w, r)
 	})
-	
+
 	// All other paths -> proxy handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -349,13 +349,13 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-						// Convert size from bytes to megabytes
+
+					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
 					log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)

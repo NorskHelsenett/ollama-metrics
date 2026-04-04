@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  GO_VERSION: "1.24"
+  CONTAINER_SUBSYS: podman
+  IMAGE_REGISTRY: quay.io
+  IMAGE_NAME: quay.io/clcollins/ollama-metrics
+
+jobs:
+  fmt:
+    name: Go Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Check formatting
+        run: |
+          output=$(gofmt -l .)
+          if [ -n "$output" ]; then
+            echo "Files not formatted:"
+            echo "$output"
+            exit 1
+          fi
+
+  vet:
+    name: Go Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Run go vet
+        run: go vet ./...
+
+  lint:
+    name: Go Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  test:
+    name: Go Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Run tests with race detector
+        run: go test -v -count=1 -race ./...
+      - name: Run tests with coverage
+        run: go test -coverprofile=coverage.txt -count=1 ./...
+      - name: Upload results to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Go Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build binary
+        run: mkdir -p out && go build -o out/ollama-metrics .
+
+  image-build:
+    name: Container Image Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Build container image
+        run: |
+          podman build -f Containerfile \
+            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --build-arg VCS_REF=$(git rev-parse HEAD) \
+            --build-arg VERSION=ci \
+            -t ${{ env.IMAGE_NAME }}:ci .
+      - name: Validate OCI labels
+        run: |
+          echo "Checking OCI labels..."
+          podman inspect ${{ env.IMAGE_NAME }}:ci --format '{{index .Config.Labels "org.opencontainers.image.title"}}' | grep -q "ollama-metrics"
+          podman inspect ${{ env.IMAGE_NAME }}:ci --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' | grep -q "$(git rev-parse HEAD)"
+          podman inspect ${{ env.IMAGE_NAME }}:ci --format '{{index .Config.Labels "org.opencontainers.image.version"}}' | grep -q "ci"
+          podman inspect ${{ env.IMAGE_NAME }}:ci --format '{{index .Config.Labels "is.collins.cluster.build.commit.id"}}' | grep -q "$(git rev-parse HEAD)"
+          podman inspect ${{ env.IMAGE_NAME }}:ci --format '{{index .Config.Labels "io.k8s.display-name"}}' | grep -q "ollama-metrics"
+          echo "All OCI labels validated successfully."
+      - name: Validate image runs
+        run: podman run --rm ${{ env.IMAGE_NAME }}:ci &
+
+  tidy-check:
+    name: Go Mod Tidy Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Check go.mod is tidy
+        run: |
+          go mod tidy
+          if [ -n "$(git diff --name-only go.mod go.sum)" ]; then
+            echo "go.mod or go.sum is not tidy. Run 'go mod tidy' and commit the changes."
+            git diff go.mod go.sum
+            exit 1
+          fi
+
+  containerfile-check:
+    name: Containerfile Tag Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check base image tags are pinned
+        run: |
+          echo "Checking Containerfile base image tags..."
+          if grep -E '^FROM\s+\S+:(latest|)\s' Containerfile; then
+            echo "ERROR: Containerfile uses :latest or untagged base image"
+            exit 1
+          fi
+          echo "All Containerfile base image tags are pinned."
+
+  yaml-lint:
+    name: YAML Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yamllint
+        run: pip install yamllint
+      - name: Run yamllint
+        run: yamllint -c .yamllint.yaml prometheus/ .github/workflows/
+
+  checkmake:
+    name: Makefile Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install checkmake
+        run: go install github.com/checkmake/checkmake/cmd/checkmake@latest
+      - name: Run checkmake
+        run: checkmake Makefile
+
+  mdlint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install markdownlint-cli2
+        run: npm install -g markdownlint-cli2
+      - name: Run markdownlint
+        run: markdownlint-cli2 '**/*.md' '#node_modules'
