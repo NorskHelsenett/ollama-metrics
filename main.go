@@ -88,6 +88,15 @@ type generateResponse struct {
 	DoneReason         interface{} `json:"done_reason,omitempty"`
 }
 
+type openAIResponse struct {
+	Model string `json:"model"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage,omitempty"`
+}
+
 type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
@@ -267,28 +276,27 @@ func main() {
 		var promptCount, generatedCount int
 		var evalDurationNs int64
 
-		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
-			// Handle streaming JSON response for generate/chat
+		isOllamaStream := r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat"
+		isOpenAIStream := strings.HasPrefix(r.URL.Path, "/v1/")
+
+		if isOllamaStream || isOpenAIStream {
+			// Stream response to client with flushing (prevents hanging)
 			var buf bytes.Buffer
-			// MultiWriter to write to client output and buffer simultaneously
 			streamWriter := io.MultiWriter(w, &buf)
 			flusher, _ := w.(http.Flusher)
-			// Stream copy loop
 			chunk := make([]byte, 1024)
 			for {
 				n, readErr := respUp.Body.Read(chunk)
 				if n > 0 {
-					// Write chunk to both client and buffer
 					if _, writeErr := streamWriter.Write(chunk[:n]); writeErr != nil {
 						log.Printf("WARNING: client write error: %v", writeErr)
 						break
 					}
 					if flusher != nil {
-						flusher.Flush() // flush chunk to client
+						flusher.Flush()
 					}
 				}
 				if readErr != nil {
-					// Break on EOF or error
 					if readErr != io.EOF {
 						log.Printf("ERROR reading upstream: %v", readErr)
 					}
@@ -296,46 +304,75 @@ func main() {
 				}
 			}
 
-			// Fix the JSON before parsing
-			bufData := fixDoneReason(buf.Bytes())
-
-			// First, try to parse as models list response
-			var modelsResp modelsResponse
-			if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
-				// This is a models list response, not a typical generate response
-				for _, model := range modelsResp.Models {
-					modelName = ensureModelTag(model.Model)
-					modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+			if isOpenAIStream {
+				// Parse OpenAI-compatible response for metrics
+				bufData := buf.Bytes()
+				// Non-streaming: single JSON object with usage
+				var oaiResp openAIResponse
+				if err := json.Unmarshal(bufData, &oaiResp); err == nil {
+					if oaiResp.Model != "" {
+						modelName = ensureModelTag(oaiResp.Model)
+					}
+					if oaiResp.Usage != nil {
+						promptCount = oaiResp.Usage.PromptTokens
+						generatedCount = oaiResp.Usage.CompletionTokens
+					}
+				} else {
+					// Streaming SSE: parse "data: {...}" lines
+					for _, line := range bytes.Split(bufData, []byte{'\n'}) {
+						line = bytes.TrimSpace(line)
+						if !bytes.HasPrefix(line, []byte("data: ")) {
+							continue
+						}
+						jsonData := bytes.TrimPrefix(line, []byte("data: "))
+						if bytes.Equal(jsonData, []byte("[DONE]")) {
+							continue
+						}
+						var chunk openAIResponse
+						if err := json.Unmarshal(jsonData, &chunk); err == nil {
+							if chunk.Model != "" {
+								modelName = ensureModelTag(chunk.Model)
+							}
+							if chunk.Usage != nil {
+								promptCount = chunk.Usage.PromptTokens
+								generatedCount = chunk.Usage.CompletionTokens
+							}
+						}
+					}
 				}
-				log.Printf("Received models list response with %d models", len(modelsResp.Models))
-				// No token counts for models list response
 			} else {
-				// Parse lines of JSON objects as standard generate responses
-				for _, line := range bytes.Split(bufData, []byte{'\n'}) {
-					if len(line) == 0 {
-						continue
-					}
+				// Parse Ollama native streaming response
+				bufData := fixDoneReason(buf.Bytes())
 
-					var res generateResponse
-					if err := json.Unmarshal(line, &res); err != nil {
-						log.Printf("WARNING: Failed to parse JSON: %v", err)
-						continue
+				var modelsResp modelsResponse
+				if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
+					for _, model := range modelsResp.Models {
+						modelName = ensureModelTag(model.Model)
+						modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
 					}
-
-					if res.Model != "" {
-						modelName = ensureModelTag(res.Model)
-					}
-
-					// If this chunk signals done, capture metrics fields
-					if res.Done != nil && *res.Done {
-						if res.PromptEvalCount != nil {
-							promptCount = *res.PromptEvalCount
+					log.Printf("Received models list response with %d models", len(modelsResp.Models))
+				} else {
+					for _, line := range bytes.Split(bufData, []byte{'\n'}) {
+						if len(line) == 0 {
+							continue
 						}
-						if res.EvalCount != nil {
-							generatedCount = *res.EvalCount
+						var res generateResponse
+						if err := json.Unmarshal(line, &res); err != nil {
+							continue
 						}
-						if res.EvalDuration != nil {
-							evalDurationNs = *res.EvalDuration
+						if res.Model != "" {
+							modelName = ensureModelTag(res.Model)
+						}
+						if res.Done != nil && *res.Done {
+							if res.PromptEvalCount != nil {
+								promptCount = *res.PromptEvalCount
+							}
+							if res.EvalCount != nil {
+								generatedCount = *res.EvalCount
+							}
+							if res.EvalDuration != nil {
+								evalDurationNs = *res.EvalDuration
+							}
 						}
 					}
 				}
@@ -366,9 +403,23 @@ func main() {
 			// We can return here since request is fully handled
 			return
 		} else {
-			// Other endpoints (e.g. /api/tags, /api/pull) - just copy through
-			io.Copy(w, respUp.Body)
-			// Try to get model name from request (if JSON body has "model")
+			// Other endpoints (e.g. /api/tags, /api/pull) — stream with flush
+			flusher, _ := w.(http.Flusher)
+			chunk := make([]byte, 1024)
+			for {
+				n, readErr := respUp.Body.Read(chunk)
+				if n > 0 {
+					if _, writeErr := w.Write(chunk[:n]); writeErr != nil {
+						break
+					}
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+				if readErr != nil {
+					break
+				}
+			}
 			if len(bodyBytes) > 0 {
 				var reqJson map[string]interface{}
 				if err := json.Unmarshal(bodyBytes, &reqJson); err == nil {
@@ -377,7 +428,6 @@ func main() {
 					}
 				}
 			}
-			// No token metrics for non-generate endpoints
 		}
 
 		// Update Prometheus metrics if applicable
