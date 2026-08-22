@@ -88,11 +88,87 @@ type generateResponse struct {
 	DoneReason         interface{} `json:"done_reason,omitempty"`
 }
 
+// openAIChatCompletionsResponse is the subset of an OpenAI-compatible chat
+// completion response needed for usage accounting. Ollama returns this shape
+// from /v1/chat/completions, both as one JSON document and as SSE data lines
+// when streaming is enabled.
+type openAIChatCompletionsResponse struct {
+	Model string `json:"model"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// parseOpenAIChatCompletionsUsage extracts the last model name and final usage
+// counters from either a non-streaming JSON response or OpenAI-style SSE.
+// Streaming chunks do not all carry usage, so retain the model found in an
+// earlier chunk while accepting usage from the final chunk.
+func parseOpenAIChatCompletionsUsage(data []byte) (string, int, int) {
+	var model string
+	var promptCount, generatedCount int
+	parse := func(payload []byte) {
+		var response openAIChatCompletionsResponse
+		if err := json.Unmarshal(payload, &response); err != nil {
+			return
+		}
+		if response.Model != "" {
+			model = ensureModelTag(response.Model)
+		}
+		if response.Usage != nil {
+			promptCount = response.Usage.PromptTokens
+			generatedCount = response.Usage.CompletionTokens
+		}
+	}
+
+	parse(data)
+	if model != "" || promptCount > 0 || generatedCount > 0 {
+		return model, promptCount, generatedCount
+	}
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		parse(payload)
+	}
+	return model, promptCount, generatedCount
+}
+
+// includeOpenAIStreamingUsage requests the final SSE usage chunk that Ollama
+// can provide for OpenAI-compatible streaming chat completions. It is opt-in
+// because clients may not expect the extra final chunk.
+func includeOpenAIStreamingUsage(data []byte) []byte {
+	var request map[string]interface{}
+	if err := json.Unmarshal(data, &request); err != nil {
+		return data
+	}
+	stream, _ := request["stream"].(bool)
+	if !stream {
+		return data
+	}
+	streamOptions, _ := request["stream_options"].(map[string]interface{})
+	if streamOptions == nil {
+		streamOptions = make(map[string]interface{})
+		request["stream_options"] = streamOptions
+	}
+	streamOptions["include_usage"] = true
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return data
+	}
+	return encoded
+}
+
 type psResponse struct {
 	Models []struct {
 		Name      string `json:"name"`
 		ID        string `json:"id"`
-		Size      int64  `json:"size"`      // Size in bytes
+		Size      int64  `json:"size"` // Size in bytes
 		Processor string `json:"processor"`
 		Until     string `json:"until"`
 	} `json:"models"`
@@ -168,7 +244,7 @@ func main() {
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
-	
+
 	// Custom metrics handler that refreshes model data before serving metrics
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Refresh model information from /api/ps before serving metrics
@@ -180,12 +256,12 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
+
 					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
@@ -197,11 +273,11 @@ func main() {
 		} else {
 			log.Printf("ERROR refreshing model metrics: %v", err)
 		}
-		
+
 		// Serve metrics using the standard Prometheus handler
 		promhttp.Handler().ServeHTTP(w, r)
 	})
-	
+
 	// All other paths -> proxy handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -216,6 +292,9 @@ func main() {
 		if r.Body != nil {
 			bodyBytes, _ = io.ReadAll(r.Body)
 			r.Body.Close()
+		}
+		if r.URL.Path == "/v1/chat/completions" && os.Getenv("INCLUDE_STREAM_USAGE") == "true" {
+			bodyBytes = includeOpenAIStreamingUsage(bodyBytes)
 		}
 
 		// Build upstream request
@@ -267,7 +346,7 @@ func main() {
 		var promptCount, generatedCount int
 		var evalDurationNs int64
 
-		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
+		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" || r.URL.Path == "/v1/chat/completions" {
 			// Handle streaming JSON response for generate/chat
 			var buf bytes.Buffer
 			// MultiWriter to write to client output and buffer simultaneously
@@ -299,43 +378,47 @@ func main() {
 			// Fix the JSON before parsing
 			bufData := fixDoneReason(buf.Bytes())
 
-			// First, try to parse as models list response
-			var modelsResp modelsResponse
-			if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
-				// This is a models list response, not a typical generate response
-				for _, model := range modelsResp.Models {
-					modelName = ensureModelTag(model.Model)
-					modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
-				}
-				log.Printf("Received models list response with %d models", len(modelsResp.Models))
-				// No token counts for models list response
+			if r.URL.Path == "/v1/chat/completions" {
+				modelName, promptCount, generatedCount = parseOpenAIChatCompletionsUsage(bufData)
 			} else {
-				// Parse lines of JSON objects as standard generate responses
-				for _, line := range bytes.Split(bufData, []byte{'\n'}) {
-					if len(line) == 0 {
-						continue
+				// First, try to parse as models list response
+				var modelsResp modelsResponse
+				if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
+					// This is a models list response, not a typical generate response
+					for _, model := range modelsResp.Models {
+						modelName = ensureModelTag(model.Model)
+						modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
 					}
-
-					var res generateResponse
-					if err := json.Unmarshal(line, &res); err != nil {
-						log.Printf("WARNING: Failed to parse JSON: %v", err)
-						continue
-					}
-
-					if res.Model != "" {
-						modelName = ensureModelTag(res.Model)
-					}
-
-					// If this chunk signals done, capture metrics fields
-					if res.Done != nil && *res.Done {
-						if res.PromptEvalCount != nil {
-							promptCount = *res.PromptEvalCount
+					log.Printf("Received models list response with %d models", len(modelsResp.Models))
+					// No token counts for models list response
+				} else {
+					// Parse lines of JSON objects as standard generate responses
+					for _, line := range bytes.Split(bufData, []byte{'\n'}) {
+						if len(line) == 0 {
+							continue
 						}
-						if res.EvalCount != nil {
-							generatedCount = *res.EvalCount
+
+						var res generateResponse
+						if err := json.Unmarshal(line, &res); err != nil {
+							log.Printf("WARNING: Failed to parse JSON: %v", err)
+							continue
 						}
-						if res.EvalDuration != nil {
-							evalDurationNs = *res.EvalDuration
+
+						if res.Model != "" {
+							modelName = ensureModelTag(res.Model)
+						}
+
+						// If this chunk signals done, capture metrics fields
+						if res.Done != nil && *res.Done {
+							if res.PromptEvalCount != nil {
+								promptCount = *res.PromptEvalCount
+							}
+							if res.EvalCount != nil {
+								generatedCount = *res.EvalCount
+							}
+							if res.EvalDuration != nil {
+								evalDurationNs = *res.EvalDuration
+							}
 						}
 					}
 				}
@@ -349,13 +432,13 @@ func main() {
 				loadedModelsGauge.Set(float64(len(ps.Models)))
 				loadedModelInfo.Reset()
 				modelRAMUsage.Reset() // Reset RAM usage before updating
-				
+
 				// Update model metrics directly from ps response
 				for _, m := range ps.Models {
 					modelName := ensureModelTag(m.Name)
 					loadedModelInfo.WithLabelValues(modelName).Set(1)
-					
-						// Convert size from bytes to megabytes
+
+					// Convert size from bytes to megabytes
 					ramMB := float64(m.Size) / (1024 * 1024)
 					modelRAMUsage.WithLabelValues(modelName).Set(ramMB)
 					log.Printf("Model %s RAM usage: %.2f MB", modelName, ramMB)
