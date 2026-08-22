@@ -30,6 +30,9 @@ It acts as a transparent proxy, forwarding all requests to Ollama while collecti
 
 - `OLLAMA_HOST` - Ollama host address (default: `http://localhost:11434`)
 - `PORT` - Port to run the metrics server on (default: `8080`)
+- `INCLUDE_STREAM_USAGE` - Set to `true` to request the final OpenAI-compatible
+  streaming usage chunk from `/v1/chat/completions`. Disabled by default because
+  it adds that final chunk to streamed responses.
 
 ### Docker
 
