@@ -123,9 +123,10 @@ var upstreamClient = &http.Client{
 }
 
 // fixDoneReason processes JSON data to handle the done_reason field that might be a number or string
+var doneReasonRe = regexp.MustCompile(`"done_reason":(\d+)`)
+
 func fixDoneReason(data []byte) []byte {
-	re := regexp.MustCompile(`"done_reason":(\d+)`)
-	return re.ReplaceAll(data, []byte(`"done_reason":"$1"`))
+	return doneReasonRe.ReplaceAll(data, []byte(`"done_reason":"$1"`))
 }
 
 // ensureModelTag adds ":latest" to model names that don't have a tag
@@ -267,24 +268,88 @@ func main() {
 		var promptCount, generatedCount int
 		var evalDurationNs int64
 
+		// Number of tokens already added to generatedTokens while streaming
+		var streamedCount int
+
 		if r.URL.Path == "/api/generate" || r.URL.Path == "/api/chat" {
 			// Handle streaming JSON response for generate/chat
-			var buf bytes.Buffer
-			// MultiWriter to write to client output and buffer simultaneously
-			streamWriter := io.MultiWriter(w, &buf)
+			var lineBuf []byte
 			flusher, _ := w.(http.Flusher)
+
+			// processLine parses one NDJSON line. Ollama streams roughly one token per
+			// non-final chunk, so the generated tokens counter is incremented as chunks
+			// arrive; the final chunk's eval_count is then used to reconcile the total.
+			processLine := func(line []byte) {
+				line = bytes.TrimSpace(line)
+				if len(line) == 0 {
+					return
+				}
+				line = fixDoneReason(line)
+
+				// Handle a models list response, not a typical generate response
+				if bytes.Contains(line, []byte(`"models"`)) {
+					var modelsResp modelsResponse
+					if err := json.Unmarshal(line, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
+						for _, model := range modelsResp.Models {
+							modelName = ensureModelTag(model.Model)
+							modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
+						}
+						log.Printf("Received models list response with %d models", len(modelsResp.Models))
+						// No token counts for models list response
+						return
+					}
+				}
+
+				var res generateResponse
+				if err := json.Unmarshal(line, &res); err != nil {
+					log.Printf("WARNING: Failed to parse JSON: %v", err)
+					return
+				}
+
+				if res.Model != "" {
+					modelName = ensureModelTag(res.Model)
+				}
+
+				if res.Done != nil && *res.Done {
+					// If this chunk signals done, capture metrics fields
+					if res.PromptEvalCount != nil {
+						promptCount = *res.PromptEvalCount
+					}
+					if res.EvalCount != nil {
+						generatedCount = *res.EvalCount
+					}
+					if res.EvalDuration != nil {
+						evalDurationNs = *res.EvalDuration
+					}
+				} else if modelName != "" {
+					// Intermediate streamed chunk: count it as a generated token right away
+					generatedTokens.WithLabelValues(modelName).Inc()
+					streamedCount++
+				}
+			}
+
 			// Stream copy loop
 			chunk := make([]byte, 1024)
 			for {
 				n, readErr := respUp.Body.Read(chunk)
 				if n > 0 {
-					// Write chunk to both client and buffer
-					if _, writeErr := streamWriter.Write(chunk[:n]); writeErr != nil {
+					// Write chunk to client
+					if _, writeErr := w.Write(chunk[:n]); writeErr != nil {
 						log.Printf("WARNING: client write error: %v", writeErr)
 						break
 					}
 					if flusher != nil {
 						flusher.Flush() // flush chunk to client
+					}
+					// Process every complete line received so far
+					lineBuf = append(lineBuf, chunk[:n]...)
+					for {
+						i := bytes.IndexByte(lineBuf, '\n')
+						if i < 0 {
+							break
+						}
+						processLine(lineBuf[:i])
+						lineBuf = lineBuf[i+1:]
 					}
 				}
 				if readErr != nil {
@@ -295,51 +360,8 @@ func main() {
 					break
 				}
 			}
-
-			// Fix the JSON before parsing
-			bufData := fixDoneReason(buf.Bytes())
-
-			// First, try to parse as models list response
-			var modelsResp modelsResponse
-			if err := json.Unmarshal(bufData, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
-				// This is a models list response, not a typical generate response
-				for _, model := range modelsResp.Models {
-					modelName = ensureModelTag(model.Model)
-					modelRAMUsage.WithLabelValues(modelName).Set(float64(model.SizeVRAM) / (1024 * 1024))
-				}
-				log.Printf("Received models list response with %d models", len(modelsResp.Models))
-				// No token counts for models list response
-			} else {
-				// Parse lines of JSON objects as standard generate responses
-				for _, line := range bytes.Split(bufData, []byte{'\n'}) {
-					if len(line) == 0 {
-						continue
-					}
-
-					var res generateResponse
-					if err := json.Unmarshal(line, &res); err != nil {
-						log.Printf("WARNING: Failed to parse JSON: %v", err)
-						continue
-					}
-
-					if res.Model != "" {
-						modelName = ensureModelTag(res.Model)
-					}
-
-					// If this chunk signals done, capture metrics fields
-					if res.Done != nil && *res.Done {
-						if res.PromptEvalCount != nil {
-							promptCount = *res.PromptEvalCount
-						}
-						if res.EvalCount != nil {
-							generatedCount = *res.EvalCount
-						}
-						if res.EvalDuration != nil {
-							evalDurationNs = *res.EvalDuration
-						}
-					}
-				}
-			}
+			// Process a trailing line without newline (e.g. non-streaming response)
+			processLine(lineBuf)
 		} else if r.URL.Path == "/api/ps" {
 			// Intercept /api/ps to update loaded models metrics
 			bodyData, _ := io.ReadAll(respUp.Body)
@@ -385,8 +407,11 @@ func main() {
 			if promptCount > 0 {
 				promptTokens.WithLabelValues(modelName).Add(float64(promptCount))
 			}
-			if generatedCount > 0 {
-				generatedTokens.WithLabelValues(modelName).Add(float64(generatedCount))
+			// Add whatever was not already counted while streaming. Streamed chunks can
+			// undercount (e.g. the EOS token or multi-byte characters split over several
+			// tokens are not streamed), so eval_count from the final chunk wins.
+			if generatedCount > streamedCount {
+				generatedTokens.WithLabelValues(modelName).Add(float64(generatedCount - streamedCount))
 			}
 			durationSec := time.Since(start).Seconds()
 			endpoint := strings.TrimPrefix(r.URL.Path, "/api/")
