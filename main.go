@@ -223,7 +223,7 @@ func main() {
 		if r.URL.RawQuery != "" {
 			targetURL += "?" + r.URL.RawQuery
 		}
-		reqUp, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
+		reqUp, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusInternalServerError)
 			log.Printf("ERROR creating upstream request: %v", err)
